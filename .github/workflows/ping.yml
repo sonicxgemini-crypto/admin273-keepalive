@@ -1,0 +1,34 @@
+name: keep-alive
+
+# Render's free web service spins down after 15 minutes without inbound
+# traffic. A sleeping instance cannot poll Telegram, so the bot goes deaf.
+# This pings the health endpoint every 5 minutes to hold it awake.
+#
+# This repo is public on purpose: GitHub disables scheduled workflows on
+# private repositories for free accounts, and public repos get them for free.
+# Nothing secret lives here — only the public health URL of the bot service.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: keep-alive
+  cancel-in-progress: true
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Ping health endpoint
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 \
+            https://admin273-detect.onrender.com/health || echo 000)
+          echo "health=$code"
+          if [ "$code" != "200" ]; then
+            echo "::warning::render health check returned $code"
+          fi
