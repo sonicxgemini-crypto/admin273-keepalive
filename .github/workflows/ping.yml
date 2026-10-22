@@ -33,6 +33,24 @@ jobs:
     # a gap is not.
     timeout-minutes: 350
     steps:
+      # The chain dispatches its own successor, so nothing may stop this job
+      # from being started twice -- GitHub's concurrency group proved not to
+      # bind reliably across a dispatch, and two live links would each fork
+      # another one, doubling until the account is throttled. This is the
+      # real lock: if another link is already in progress, this one exits.
+      - name: Claim the chain (exit if another link is live)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -u
+          others=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?status=in_progress&per_page=20" \
+            --jq "[.workflow_runs[] | select(.id != ${{ github.run_id }} and .name == \"keep-alive\")] | length")
+          echo "other in-progress keep-alive links: $others"
+          if [ "$others" -gt 0 ]; then
+            echo "another link owns the chain -- exiting"
+            exit 0
+          fi
+
       - name: Ping Render every 5 minutes, then hand off
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
