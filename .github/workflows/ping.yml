@@ -1,34 +1,72 @@
 name: keep-alive
 
-# Render's free web service spins down after 15 minutes without inbound
-# traffic. A sleeping instance cannot poll Telegram, so the bot goes deaf.
-# This pings the health endpoint every 5 minutes to hold it awake.
+# Render suspends the free web service after 15 minutes with no inbound
+# request, and a suspended service cannot poll Telegram -- the bot goes
+# deaf until something wakes it. This holds it open.
 #
-# This repo is public on purpose: GitHub disables scheduled workflows on
-# private repositories for free accounts, and public repos get them for free.
-# Nothing secret lives here — only the public health URL of the bot service.
+# Why a chain instead of a plain cron: GitHub starves `schedule` triggers on
+# free accounts, so a */5 cron here actually fired every ~5 hours (measured:
+# 22:29 -> 00:52 -> 05:47 -> 10:41). Not enough -- 5 hours of sleep a night.
+#
+# So each run pings on a loop for ~5.5 hours, then dispatches the next run
+# through `workflow_dispatch`, which is NOT throttled. The schedule trigger
+# is kept only as a safety net: if a link in the chain ever breaks, cron
+# still fires a few times a day and restarts it. This repo is public, so the
+# minutes are free and unlimited.
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: keep-alive
-  cancel-in-progress: true
+  group: keep-alive-chain
+  cancel-in-progress: false
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    # Free accounts cap a job at 360 minutes. Hand off at 330 so the next
+    # run is already pinging before this one exits -- overlap is harmless,
+    # a gap is not.
+    timeout-minutes: 350
     steps:
-      - name: Ping health endpoint
+      - name: Ping Render every 5 minutes, then hand off
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          URL: https://admin273-detect.onrender.com/health
+          HANDOFF_AT_MIN: "330"
+          NEXT_RUN_AT_MIN: "325"
         run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 \
-            https://admin273-detect.onrender.com/health || echo 000)
-          echo "health=$code"
-          if [ "$code" != "200" ]; then
-            echo "::warning::render health check returned $code"
-          fi
+          set -u
+          start=$(date +%s)
+          handoff=$((HANDOFF_AT_MIN * 60))
+          next=$((NEXT_RUN_AT_MIN * 60))
+          fired=0
+
+          while :; do
+            now=$(date +%s)
+            elapsed=$((now - start))
+
+            # Dispatch the successor first. If this job dies right after, the
+            # chain still continues.
+            if [ "$fired" -eq 0 ] && [ "$elapsed" -ge "$next" ]; then
+              gh workflow run keep-alive.yml --repo "$GITHUB_REPOSITORY"
+              echo "$(date -u +%FT%TZ) dispatched successor run"
+              fired=1
+            fi
+            if [ "$elapsed" -ge "$handoff" ]; then
+              echo "$(date -u +%FT%TZ) chain handed off, exiting cleanly"
+              exit 0
+            fi
+
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 "$URL" || echo 000)
+            echo "$(date -u +%FT%TZ) health=$code elapsed=${elapsed}s"
+            if [ "$code" != "200" ]; then
+              echo "::warning::render health check returned $code"
+            fi
+
+            sleep 300
+          done
